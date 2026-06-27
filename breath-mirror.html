@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Breath Mirror</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; cursor: none; }
+  #container { position: relative; width: 100vw; height: 100vh; }
+  video { position: absolute; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); opacity: 0; pointer-events: none; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  #cameraCanvas { z-index: 1; }
+  #maskCanvas   { z-index: 0; display: none; }
+  #blurCanvas   { z-index: 2; }
+  #frameCanvas  { z-index: 3; pointer-events: none; }
+
+  #cursor {
+    position: fixed; width: 20px; height: 20px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.7); background: rgba(255,255,255,0.08);
+    pointer-events: none; z-index: 100; transform: translate(-50%, -50%);
+    opacity: 0; transition: opacity 0.15s;
+  }
+  #cursor.drawing { background: rgba(255,255,255,0.9); border-color: #fff; }
+
+  #breathRing {
+    position: fixed; bottom: 110px; left: 50%; transform: translateX(-50%);
+    width: 44px; height: 44px; border-radius: 50%;
+    border: 1.5px solid rgba(255,255,255,0.12); z-index: 50; pointer-events: none;
+    transition: border-color 0.1s, box-shadow 0.1s;
+  }
+  #breathRing.active { border-color: rgba(210,225,235,0.9); box-shadow: 0 0 20px rgba(210,225,235,0.35); }
+
+  #status {
+    position: fixed; bottom: 164px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.4); font-size: 11px; letter-spacing: 0.18em;
+    text-transform: uppercase; font-family: Georgia, serif;
+    pointer-events: none; white-space: nowrap; z-index: 50;
+  }
+
+  #countdown {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 140px; font-family: Georgia, serif;
+    color: rgba(255,255,255,0.9); text-shadow: 0 0 40px rgba(255,255,255,0.4);
+    pointer-events: none; z-index: 60; opacity: 0; transition: opacity 0.2s;
+  }
+  #countdown.show { opacity: 1; }
+
+  #btnGroup { position: fixed; top: 20px; right: 20px; z-index: 50; display: flex; gap: 8px; }
+  #btnGroup button {
+    background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.4);
+    color: rgba(255,255,255,0.9); padding: 8px 16px; font-size: 11px;
+    letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer;
+    border-radius: 4px; font-family: Georgia, serif; transition: all 0.15s;
+    backdrop-filter: blur(6px);
+  }
+  #btnGroup button:hover { background: rgba(255,255,255,0.2); }
+  #btnGroup button:active { transform: scale(0.96); }
+
+  #photoStrip {
+    position: fixed; bottom: 0; left: 0; right: 0; height: 80px;
+    display: flex; align-items: center; gap: 8px; padding: 8px 16px;
+    z-index: 55; overflow-x: auto;
+    background: linear-gradient(to top, rgba(0,0,0,0.6), transparent);
+  }
+  #photoStrip::-webkit-scrollbar { display: none; }
+  .photo-thumb {
+    position: relative; flex-shrink: 0; height: 62px; border-radius: 4px;
+    overflow: hidden; cursor: pointer;
+    border: 1.5px solid rgba(255,255,255,0.25);
+    transition: border-color 0.15s, transform 0.15s;
+    animation: thumbIn 0.3s ease;
+  }
+  .photo-thumb:hover { border-color: rgba(255,255,255,0.8); transform: scale(1.05); }
+  .photo-thumb img { height: 100%; display: block; }
+  .save-btn {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.55); color: white; font-size: 10px;
+    letter-spacing: 0.1em; font-family: Georgia, serif; text-transform: uppercase;
+    opacity: 0; transition: opacity 0.15s;
+  }
+  .photo-thumb:hover .save-btn { opacity: 1; }
+  @keyframes thumbIn { from { opacity:0; transform:scale(0.8) translateY(10px); } to { opacity:1; transform:scale(1); } }
+
+  #flash { position: fixed; inset: 0; z-index: 200; background: white; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="cameraCanvas"></canvas>
+  <canvas id="maskCanvas"></canvas>
+  <canvas id="blurCanvas"></canvas>
+  <canvas id="frameCanvas"></canvas>
+</div>
+<div id="cursor"></div>
+<div id="status">initializing…</div>
+<div id="breathRing"></div>
+<div id="countdown"></div>
+<div id="btnGroup">
+  <button id="undoBtn">↩ undo</button>
+  <button id="clearBtn">✕ clear</button>
+</div>
+<div id="photoStrip"></div>
+<div id="flash"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+const video        = document.getElementById('video');
+const cameraCanvas = document.getElementById('cameraCanvas');
+const maskCanvas   = document.getElementById('maskCanvas');
+const blurCanvas   = document.getElementById('blurCanvas');
+const frameCanvas  = document.getElementById('frameCanvas');
+const camCtx       = cameraCanvas.getContext('2d');
+const maskCtx      = maskCanvas.getContext('2d');
+const blurCtx      = blurCanvas.getContext('2d');
+const frameCtx     = frameCanvas.getContext('2d');
+const cursor       = document.getElementById('cursor');
+const statusEl     = document.getElementById('status');
+const breathRing   = document.getElementById('breathRing');
+const flashEl      = document.getElementById('flash');
+const countdownEl  = document.getElementById('countdown');
+const photoStrip   = document.getElementById('photoStrip');
+
+const offscreen = document.createElement('canvas');
+const offCtx    = offscreen.getContext('2d');
+
+let W = 0, H = 0, fogReady = false;
+
+// ── Resize ────────────────────────────────────────────────────────────
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  [cameraCanvas, maskCanvas, blurCanvas, frameCanvas].forEach(c => { c.width = W; c.height = H; });
+  offscreen.width = W; offscreen.height = H;
+}
+window.addEventListener('resize', resize);
+
+// ── Render ────────────────────────────────────────────────────────────
+function render() {
+  requestAnimationFrame(render);
+  if (video.readyState < 2) return;
+  camCtx.save(); camCtx.translate(W, 0); camCtx.scale(-1, 1);
+  camCtx.drawImage(video, 0, 0, W, H); camCtx.restore();
+  offCtx.save();
+  offCtx.filter = 'blur(14px) brightness(1.05)';
+  offCtx.translate(W, 0); offCtx.scale(-1, 1);
+  offCtx.drawImage(video, 0, 0, W, H); offCtx.restore();
+  offCtx.fillStyle = 'rgba(205,218,228,0.35)';
+  offCtx.fillRect(0, 0, W, H);
+  blurCtx.clearRect(0, 0, W, H);
+  blurCtx.drawImage(offscreen, 0, 0);
+  blurCtx.globalCompositeOperation = 'destination-in';
+  blurCtx.drawImage(maskCanvas, 0, 0);
+  blurCtx.globalCompositeOperation = 'source-over';
+}
+
+// ── Fog ───────────────────────────────────────────────────────────────
+let breathCooldown = 0;
+function addFog(volume) {
+  if (breathCooldown > 0) { breathCooldown--; return; }
+  fogReady = true;
+  for (let i = 0; i < 3 + Math.floor(Math.random()*3); i++) {
+    const cx = W*0.5 + (Math.random()-0.5)*W*0.6;
+    const cy = H*0.5 + (Math.random()-0.5)*H*0.3;
+    const r  = 100 + Math.random()*200 + volume*600;
+    const a  = Math.min(1, 0.4 + volume*4);
+    const g  = maskCtx.createRadialGradient(cx,cy,0,cx,cy,r);
+    g.addColorStop(0, `rgba(255,255,255,${a})`);
+    g.addColorStop(0.5, `rgba(255,255,255,${a*0.65})`);
+    g.addColorStop(1, `rgba(255,255,255,0)`);
+    maskCtx.save();
+    maskCtx.globalCompositeOperation = 'source-over';
+    maskCtx.fillStyle = g;
+    maskCtx.beginPath(); maskCtx.arc(cx,cy,r,0,Math.PI*2); maskCtx.fill();
+    maskCtx.restore();
+  }
+  breathCooldown = 4;
+  if (!countingDown) statusEl.textContent = 'pinch to draw';
+}
+
+// ── Draw ──────────────────────────────────────────────────────────────
+let smoothX = null, smoothY = null;
+const SMOOTH = 0.4;
+let trail = [], lastDrawX = null, lastDrawY = null;
+
+function eraseAt(rawX, rawY) {
+  if (smoothX === null) { smoothX = rawX; smoothY = rawY; }
+  smoothX += SMOOTH * (rawX - smoothX);
+  smoothY += SMOOTH * (rawY - smoothY);
+  const x = smoothX, y = smoothY;
+  lastDrawX = x; lastDrawY = y;
+  trail.push({x, y}); if (trail.length > 6) trail.shift();
+  if (trail.length < 2) return;
+  maskCtx.save();
+  maskCtx.globalCompositeOperation = 'destination-out';
+  maskCtx.strokeStyle = 'rgba(0,0,0,1)';
+  maskCtx.lineWidth = 40; maskCtx.lineCap = 'round'; maskCtx.lineJoin = 'round';
+  maskCtx.beginPath();
+  if (trail.length === 2) {
+    maskCtx.moveTo(trail[0].x, trail[0].y);
+    maskCtx.lineTo(trail[1].x, trail[1].y);
+  } else {
+    maskCtx.moveTo((trail[0].x+trail[1].x)/2, (trail[0].y+trail[1].y)/2);
+    for (let i = 1; i < trail.length-1; i++) {
+      maskCtx.quadraticCurveTo(trail[i].x, trail[i].y,
+        (trail[i].x+trail[i+1].x)/2, (trail[i].y+trail[i+1].y)/2);
+    }
+  }
+  maskCtx.stroke(); maskCtx.restore();
+}
+
+function resetDraw() {
+  smoothX = null; smoothY = null;
+  trail = []; lastDrawX = null; lastDrawY = null;
+}
+
+// ── Undo ──────────────────────────────────────────────────────────────
+let undoStack = [], isDrawingStroke = false;
+function saveSnapshot() {
+  undoStack.push(maskCtx.getImageData(0, 0, W, H));
+  if (undoStack.length > 20) undoStack.shift();
+}
+function undo() {
+  if (!undoStack.length) return;
+  maskCtx.putImageData(undoStack.pop(), 0, 0);
+}
+
+// ── Capture ───────────────────────────────────────────────────────────
+const HOLD_MS = 1500;
+let holdStart = null, countingDown = false, countTimer = null;
+
+function isLShape(lm) {
+  return lm[8].y < lm[6].y &&
+         Math.abs(lm[4].x - lm[2].x) > 0.04 &&
+         lm[12].y > lm[10].y &&
+         lm[16].y > lm[14].y;
+}
+
+function drawCaptureFrame(lm1, lm2, progress) {
+  frameCtx.clearRect(0, 0, W, H);
+  const x1=(1-lm1[8].x)*W, y1=lm1[8].y*H;
+  const x2=(1-lm2[8].x)*W, y2=lm2[8].y*H;
+  const left=Math.min(x1,x2), right=Math.max(x1,x2);
+  const top=Math.min(y1,y2), bottom=top+(right-left)*0.75;
+  const cLen=(right-left)*0.18;
+  frameCtx.strokeStyle = `rgba(255,255,255,${0.5+progress*0.5})`;
+  frameCtx.lineWidth = 2+progress*1.5; frameCtx.lineCap = 'square';
+  [[left,top+cLen,left,top,left+cLen,top],
+   [right-cLen,top,right,top,right,top+cLen],
+   [left,bottom-cLen,left,bottom,left+cLen,bottom],
+   [right-cLen,bottom,right,bottom,right,bottom-cLen]
+  ].forEach(([x1,y1,x2,y2,x3,y3]) => {
+    frameCtx.beginPath();
+    frameCtx.moveTo(x1,y1); frameCtx.lineTo(x2,y2); frameCtx.lineTo(x3,y3);
+    frameCtx.stroke();
+  });
+}
+
+function startCountdown() {
+  countingDown = true;
+  let count = 3;
+  countdownEl.textContent = count;
+  countdownEl.classList.add('show');
+  statusEl.textContent = 'get ready…';
+  countTimer = setInterval(() => {
+    count--;
+    if (count > 0) {
+      countdownEl.textContent = count;
+    } else {
+      clearInterval(countTimer);
+      countdownEl.classList.remove('show');
+      countdownEl.textContent = '';
+      countingDown = false;
+      doCapture();
+    }
+  }, 1000);
+}
+
+function doCapture() {
+  flashEl.style.transition = 'none';
+  flashEl.style.opacity = '0.9';
+  setTimeout(() => { flashEl.style.transition = 'opacity 0.3s'; flashEl.style.opacity = '0'; }, 80);
+  const snap = document.createElement('canvas');
+  snap.width = W; snap.height = H;
+  const sCtx = snap.getContext('2d');
+  sCtx.drawImage(cameraCanvas, 0, 0);
+  sCtx.drawImage(blurCanvas, 0, 0);
+  snap.toBlob(blob => {
+    const url = URL.createObjectURL(blob);
+    const wrap = document.createElement('div');
+    wrap.className = 'photo-thumb';
+    const img = document.createElement('img');
+    img.src = url;
+    const btn = document.createElement('div');
+    btn.className = 'save-btn';
+    btn.textContent = '↓ save';
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const a = document.createElement('a');
+      a.href = url; a.download = `breath-mirror-${Date.now()}.png`; a.click();
+    });
+    wrap.appendChild(img); wrap.appendChild(btn);
+    photoStrip.appendChild(wrap);
+    wrap.scrollIntoView({ behavior: 'smooth', inline: 'end' });
+    frameCtx.clearRect(0, 0, W, H);
+    holdStart = null;
+    statusEl.textContent = fogReady ? 'pinch to draw' : 'blow on the screen';
+  }, 'image/png');
+}
+
+// ── Hands ─────────────────────────────────────────────────────────────
+const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+hands.setOptions({ maxNumHands:2, modelComplexity:1, minDetectionConfidence:0.6, minTrackingConfidence:0.5 });
+
+hands.onResults(results => {
+  const all = results.multiHandLandmarks || [];
+
+  // DRAW
+  if (all.length >= 1 && !countingDown) {
+    const lm = all[0];
+    const fx = (1-lm[8].x)*W, fy = lm[8].y*H;
+    const tx = (1-lm[4].x)*W, ty = lm[4].y*H;
+    const pinching = Math.hypot(fx-tx, fy-ty) < W*0.055;
+    cursor.style.left = fx+'px'; cursor.style.top = fy+'px'; cursor.style.opacity = '1';
+    if (pinching && fogReady) {
+      holdStart = null; frameCtx.clearRect(0,0,W,H);
+      cursor.classList.add('drawing');
+      if (!isDrawingStroke) { saveSnapshot(); isDrawingStroke = true; }
+      eraseAt(fx, fy);
+      statusEl.textContent = 'drawing…';
+      return;
+    } else {
+      cursor.classList.remove('drawing');
+      isDrawingStroke = false; resetDraw();
+    }
+  } else if (!countingDown) {
+    cursor.style.opacity = '0';
+    isDrawingStroke = false; resetDraw();
+  }
+
+  // CAPTURE
+  if (!countingDown) {
+    const bothL = all.length === 2 && isLShape(all[0]) && isLShape(all[1]);
+    if (bothL) {
+      if (!holdStart) holdStart = Date.now();
+      const elapsed = Date.now() - holdStart;
+      drawCaptureFrame(all[0], all[1], Math.min(elapsed/HOLD_MS, 1));
+      statusEl.textContent = '📷 hold…';
+      if (elapsed >= HOLD_MS) { holdStart = null; frameCtx.clearRect(0,0,W,H); startCountdown(); }
+    } else {
+      if (holdStart) { holdStart = null; frameCtx.clearRect(0,0,W,H); }
+      if (!fogReady) statusEl.textContent = 'blow on the screen';
+      else if (all.length >= 1) statusEl.textContent = 'pinch to draw';
+    }
+  }
+});
+
+// ── Camera ────────────────────────────────────────────────────────────
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio: false
+    });
+    video.srcObject = stream; await video.play();
+    const mpCam = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 1280, height: 720
+    });
+    mpCam.start(); resize(); render();
+    statusEl.textContent = 'blow on the screen';
+  } catch(e) { statusEl.textContent = 'camera access needed'; }
+}
+
+// ── Mic ───────────────────────────────────────────────────────────────
+async function startMic() {
+  try {
+    const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const ac = new AudioContext();
+    const src = ac.createMediaStreamSource(ms);
+    const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 800;
+    src.connect(hp);
+    const an = ac.createAnalyser(); an.fftSize = 512; hp.connect(an);
+    const buf = new Float32Array(an.frequencyBinCount);
+    let rTO = null;
+    (function tick() {
+      requestAnimationFrame(tick);
+      an.getFloatTimeDomainData(buf);
+      let s = 0; for (const v of buf) s += v*v;
+      const rms = Math.sqrt(s/buf.length);
+      if (rms > 0.014) {
+        addFog(rms);
+        breathRing.classList.add('active');
+        clearTimeout(rTO); rTO = setTimeout(() => breathRing.classList.remove('active'), 300);
+      }
+    })();
+  } catch(e) {}
+}
+
+// ── Buttons ───────────────────────────────────────────────────────────
+document.getElementById('undoBtn').addEventListener('click', undo);
+document.getElementById('clearBtn').addEventListener('click', () => {
+  maskCtx.clearRect(0,0,W,H);
+  undoStack = []; fogReady = false; resetDraw();
+  statusEl.textContent = 'blow on the screen';
+});
+
+startCamera(); startMic();
+</script>
+</body>
+</html>
